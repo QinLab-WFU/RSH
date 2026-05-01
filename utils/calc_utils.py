@@ -1,0 +1,395 @@
+import faiss
+import torch
+import numpy as np
+import torch.nn.functional as F
+
+def calc_hammingDist(B1, B2):
+    q = B2.shape[1]
+    if len(B1.shape) < 2:
+        B1 = B1.unsqueeze(0)
+    distH = 0.5 * (q - B1.mm(B2.transpose(0, 1)))
+    return distH
+
+def sizeof_fmt(num, suffix="B"):
+    for unit in ("", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"):
+        if abs(num) < 1024.0:
+            return f"{num:3.1f}{unit}{suffix}"
+        num /= 1024.0
+    return f"{num:.1f}Yi{suffix}"
+
+
+def calc_map_k_matrix(qB, rB, query_L, retrieval_L, k=None, rank=0):
+    
+    num_query = query_L.shape[0]
+    if qB.is_cuda:
+        qB = qB.cpu()
+        rB = rB.cpu()
+    map = 0
+    if k is None:
+        k = retrieval_L.shape[0]
+    for iter in range(num_query):
+        gnd = (query_L[iter].unsqueeze(0).mm(retrieval_L.t()) > 0).type(torch.float).squeeze()
+        tsum = torch.sum(gnd)
+        if tsum == 0:
+            continue
+        hamm = calc_hammingDist(qB[iter, :], rB)
+        _, ind = torch.sort(hamm)
+        ind.squeeze_()
+        gnd = gnd[ind]
+        total = min(k, int(tsum))
+        count = torch.arange(1, total + 1).type(torch.float).to(gnd.device)
+        tindex = torch.nonzero(gnd)[:total].squeeze().type(torch.float) + 1.0
+        map += torch.mean(count / tindex)
+    map = map / num_query
+    return map
+
+
+def calc_recall_at_1(qB, rB, query_L, retrieval_L, k=None, rank=0):
+    """
+    计算 Recall@1
+    参数:
+        qB: 查询样本的哈希码 [num_query, bit] (如图像)
+        rB: 检索库的哈希码 [num_retrieval, bit] (如文本)
+        query_L: 查询样本的标签 [num_query, num_classes]
+        retrieval_L: 检索库的标签 [num_retrieval, num_classes]
+    """
+    # 确保数据在CPU上
+    if qB.is_cuda:
+        qB = qB.cpu()
+        rB = rB.cpu()
+        query_L = query_L.cpu()
+        retrieval_L = retrieval_L.cpu()
+
+    # 使用FAISS进行最近邻搜索
+    faiss_search_index = faiss.IndexFlatL2(rB.shape[-1])
+    faiss_search_index.add(rB.numpy())
+
+    # 搜索每个查询样本的最近1个邻居
+    _, k_nn = faiss_search_index.search(qB.numpy(), 1)
+
+    # 获取最近邻的标签
+    k_nn_labels = retrieval_L[k_nn[:, 0]]  # 形状: [num_query, num_classes]
+
+    # 计算Recall@1
+    recall_at_1 = 0
+    for i in range(len(query_L)):
+        query_label = query_L[i]
+        retrieved_label = k_nn_labels[i]
+
+        # 检查是否有共同的标签
+        if ((query_label * retrieved_label).sum() > 0):
+            recall_at_1 += 1
+
+    recall_at_1 = recall_at_1 / len(query_L)
+    return recall_at_1
+
+def calc_map_k(qB, rB, query_L, retrieval_L, k=None, rank=0):
+
+    num_query = query_L.shape[0]
+    qB = torch.sign(qB)
+    rB = torch.sign(rB)
+    map = 0
+    if k is None:
+        k = retrieval_L.shape[0]
+    for iter in range(num_query):
+        q_L = query_L[iter]
+        if len(q_L.shape) < 2:
+            q_L = q_L.unsqueeze(0)      # [1, hash length]
+        gnd = (q_L.mm(retrieval_L.transpose(0, 1)) > 0).squeeze().type(torch.float32)
+        tsum = torch.sum(gnd)
+        if tsum == 0:
+            continue
+        hamm = calc_hammingDist(qB[iter, :], rB)
+        _, ind = torch.sort(hamm)
+        ind.squeeze_()
+        gnd = gnd[ind]
+        total = min(k, int(tsum))
+        count = torch.arange(1, total + 1).type(torch.float32)
+        tindex = torch.nonzero(gnd)[:total].squeeze().type(torch.float32) + 1.0
+        if tindex.is_cuda:
+            count = count.to(rank)
+        map = map + torch.mean(count / tindex)
+    map = map / num_query
+    return map
+
+
+def calc_map_k_from_dist(dist_matrix, qB, rB, query_L, retrieval_L, k=None, rank=0):
+    num_query = query_L.shape[0]
+    map = 0.0
+    if k is None:
+        k = retrieval_L.shape[0]
+
+    # 确保输入为CPU Tensor
+    dist_matrix = dist_matrix.cpu().float()
+    retrieval_L = retrieval_L.cpu()
+    query_L = query_L.cpu()
+
+    for i in range(num_query):
+        q_label = query_L[i].unsqueeze(0)  # 保持二维形状 [1, C]
+        gnd = (q_label @ retrieval_L.T > 0).squeeze().float()  # [M]
+
+        # 按距离升序排序（越小越相关）
+        _, indices = torch.sort(dist_matrix[i])
+        gnd_sorted = gnd[indices]
+
+        # 计算相关样本数
+        total_relevant = torch.sum(gnd_sorted[:k])
+        if total_relevant == 0:
+            continue
+
+        # 计算平均精度
+        relevant_pos = torch.nonzero(gnd_sorted[:k]).squeeze() + 1  # 位置从1开始
+        precision_at_k = torch.arange(1, total_relevant + 1).float() / relevant_pos.float()
+        map += torch.mean(precision_at_k)
+
+    map /= num_query
+    return map.item()
+
+
+def calc_precisions_topn_matrix(qB, rB, query_L, retrieval_L, recall_gas=0.02, num_retrieval=10000):
+    if not isinstance(qB, torch.Tensor):
+        qB = torch.from_numpy(qB)
+        rB = torch.from_numpy(rB)
+        query_L = torch.from_numpy(query_L)
+        retrieval_L = torch.from_numpy(retrieval_L)
+    qB = qB.float()
+    rB = rB.float()
+    qB = torch.sign(qB - 0.5)
+    rB = torch.sign(rB - 0.5)
+    if qB.is_cuda:
+        qB = qB.cpu()
+        rB = rB.cpu()
+    num_query = query_L.shape[0]
+    # num_retrieval = retrieval_L.shape[0]
+    precisions = [0] * int(1 / recall_gas)
+    gnds = (query_L.mm(retrieval_L.transpose(0, 1)) > 0).squeeze().type(torch.float32)
+    hamms = calc_hammingDist(qB, rB)
+    _, inds = torch.sort(hamms, dim=-1)
+    for iter in range(num_query):
+        gnd = gnds[iter]
+        ind = inds[iter]
+
+        gnd = gnd[ind]
+        for i, recall in enumerate(np.arange(recall_gas, 1 + recall_gas, recall_gas)):
+            total = int(num_retrieval * recall)
+            right = torch.nonzero(gnd[: total]).squeeze().numpy()
+
+            right_num = right.size
+            precisions[i] += (right_num/total)
+    for i in range(len(precisions)):
+        precisions[i] /= num_query
+    return precisions
+
+
+def calc_precisions_topn(qB, rB, query_L, retrieval_L, recall_gas=0.02, num_retrieval=10000):
+    qB = qB.float()
+    rB = rB.float()
+    qB = torch.sign(qB - 0.5)
+    rB = torch.sign(rB - 0.5)
+    num_query = query_L.shape[0]
+    # num_retrieval = retrieval_L.shape[0]
+    precisions = [0] * int(1 / recall_gas)
+    for iter in range(num_query):
+        q_L = query_L[iter]
+        if len(q_L.shape) < 2:
+            q_L = q_L.unsqueeze(0)  # [1, hash length]
+        gnd = (q_L.mm(retrieval_L.transpose(0, 1)) > 0).squeeze().type(torch.float32)
+        hamm = calc_hammingDist(qB[iter, :], rB)
+        _, ind = torch.sort(hamm)
+        ind.squeeze_()
+        gnd = gnd[ind]
+        for i, recall in enumerate(np.arange(recall_gas, 1 + recall_gas, recall_gas)):
+            total = int(num_retrieval * recall)
+            right = torch.nonzero(gnd[: total]).squeeze().numpy()
+            # right_num = torch.nonzero(gnd[: total]).squeeze().shape[0]
+            right_num = right.size
+            precisions[i] += (right_num/total)
+    for i in range(len(precisions)):
+        precisions[i] /= num_query
+    return precisions
+
+
+def calc_precisions_hash(qB, rB, query_L, retrieval_L):
+    qB = qB.float()
+    rB = rB.float()
+    qB = torch.sign(qB - 0.5)
+    rB = torch.sign(rB - 0.5)
+    num_query = query_L.shape[0]
+    num_retrieval = retrieval_L.shape[0]
+    bit = qB.shape[1]
+    hamm = calc_hammingDist(qB, rB)
+    hamm = hamm.type(torch.ByteTensor)
+    total_num = [0] * (bit + 1)
+    max_hamm = int(torch.max(hamm))
+    gnd = (query_L.mm(retrieval_L.transpose(0, 1)) > 0).squeeze()
+    total_right = torch.sum(torch.matmul(query_L, retrieval_L.t())>0)
+    precisions = np.zeros([max_hamm + 1])
+    recalls = np.zeros([max_hamm + 1])
+    # _, index = torch.sort(hamm)
+    # del _
+    # for i in range(index.shape[0]):
+    #     gnd[i, :] = gnd[i, index[i]]
+    # del index
+    right_num = 0
+    recall_num = 0
+    for i, radius in enumerate(range(0, max_hamm+1)):
+        recall = torch.nonzero(hamm == radius)
+        right = gnd[recall.split(1, dim=1)]
+        recall_num += recall.shape[0]
+        del recall
+        right_num += torch.nonzero(right).shape[0]
+        del right
+        precisions[i] += (right_num / (recall_num + 1e-8))
+        # recalls[i] += (recall_num / num_retrieval / num_query)
+        recalls[i] += (recall_num / total_right)
+    return precisions, recalls
+
+def calc_precisions_hash_my(qB, rB, *, Gnd, num_query, num_retrieval):
+    if not isinstance(qB, torch.Tensor):
+        qB = torch.from_numpy(qB)
+    if not isinstance(rB, torch.Tensor):
+        rB = torch.from_numpy(rB)
+    if not isinstance(Gnd, torch.Tensor):
+        Gnd = torch.from_numpy(Gnd)
+
+    def CalcHammingDist_np(B1, B2):
+        q = B2.shape[1]
+        distH = 0.5 * (q - np.dot(B1, B2.transpose()))
+        return distH
+    bit = qB.shape[1]
+    # if isinstance(qB, np.ndarray):
+    #     hamm = CalcHammingDist_np(qB, rB)
+    # else:
+    hamm = calc_hammingDist(qB, rB)
+    hamm = hamm.type(torch.ByteTensor)
+    total_num = [0] * (bit + 1)
+    max_hamm = int(torch.max(hamm))
+
+    gnd = Gnd
+
+    total_right = torch.sum(gnd>0)
+    precisions = np.zeros([max_hamm + 1])
+    recalls = np.zeros([max_hamm + 1])
+
+    right_num = 0
+    recall_num = 0
+    for i, radius in enumerate(range(0, max_hamm+1)):
+        recall = torch.nonzero(hamm == radius)
+        right = gnd[recall.split(1, dim=1)]
+        recall_num += recall.shape[0]
+        del recall
+        right_num += torch.nonzero(right).shape[0]
+        del right
+        precisions[i] += (right_num / (recall_num + 1e-8))
+        recalls[i] += (recall_num / num_retrieval / num_query)
+        # recalls[i] += (recall_num / total_right)
+    p = precisions.round(2)
+    r = recalls.round(2)
+    # return p, r
+
+    precisions = []
+    recalls = []
+
+    precision_ = 0
+    num = 1
+    for i in range(len(r) - 1):
+        if r[i] == r[i + 1]:
+            precision_ += p[i]
+            num += 1
+        else:
+            precision_ += p[i]
+            precisions.append(precision_ / num)
+            recalls.append(r[i])
+            precision_ = 0
+            num = 1
+            
+    return np.asarray(precisions).round(2), np.asarray(recalls)
+
+
+def calc_precisions_hamming_radius(qB, rB, query_L, retrieval_L, hamming_gas=1):
+    num_query = query_L.shape[0]
+    bit = qB.shape[1]
+    precisions = [0] * int(bit / hamming_gas)
+    for iter in range(num_query):
+        q_L = query_L[iter]
+        if len(q_L.shape) < 2:
+            q_L = q_L.unsqueeze(0)  # [1, hash length]
+        gnd = (q_L.mm(retrieval_L.transpose(0, 1)) > 0).squeeze().type(torch.float32)
+        hamm = calc_hammingDist(qB[iter, :], rB)
+        _, ind = torch.sort(hamm)
+        ind.squeeze_()
+        gnd = gnd[ind]
+        for i, recall in enumerate(np.arange(1, bit+1, hamming_gas)):
+            total = torch.nonzero(hamm <= recall).squeeze().shape[0]
+            if total == 0:
+                precisions[i] += 0
+                continue
+            right = torch.nonzero(gnd[: total]).squeeze().numpy()
+            right_num = right.size
+
+            precisions[i] += (right_num / total)
+    for i in range(len(precisions)):
+        precisions[i] /= num_query
+    return precisions
+
+
+def calc_neighbor(label1, label2):
+    # calculate the similar matrix
+    Sim = label1.matmul(label2.transpose(0, 1)) > 0
+    return Sim.float()
+
+
+def norm_max_min(x: torch.Tensor, dim=None):
+    if dim is None:
+        max = torch.max(x)
+        min = torch.min(x)
+    if dim is not None:
+        max = torch.max(x, dim=dim)[0]
+        min = torch.min(x, dim=dim)[0]
+        if dim > 0:
+            max = max.unsqueeze(len(x.shape) - 1)
+            min = min.unsqueeze(len(x.shape) - 1)
+    norm = (x - min) / (max - min)
+    return norm
+
+
+def norm_mean(x: torch.Tensor, dim=None):
+    if dim is None:
+        mean = torch.mean(x)
+        std = torch.std(x)
+    if dim is not None:
+        mean = torch.mean(x, dim=dim)
+        std = torch.std(x, dim=dim)
+        if dim > 0:
+            mean = mean.unsqueeze(len(x.shape) - 1)
+            std = std.unsqueeze(len(x.shape) - 1)
+    norm = (x - mean) / std
+    return norm
+
+
+def norm_abs_mean(x: torch.Tensor, dim=None):
+    if dim is None:
+        mean = torch.mean(x)
+        std = torch.std(x)
+    if dim is not None:
+        mean = torch.mean(x, dim=dim)
+        std = torch.std(x, dim=dim)
+        if dim > 0:
+            mean = mean.unsqueeze(len(x.shape) - 1)
+            std = std.unsqueeze(len(x.shape) - 1)
+    norm = torch.abs(x - mean) / std
+    return norm
+
+
+def factorial(n):
+    if n == 0:
+        return 1
+    else:
+        return n * factorial(n - 1)
+
+
+def calc_IF(all_bow):
+    word_num = torch.sum(all_bow, dim=0)
+    total_num = torch.sum(word_num)
+    IF = word_num / total_num
+    return IF
